@@ -691,6 +691,32 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig<std::io::
     };
 
     let quic_relay_ratelimit = limits.client_rx;
+
+    // Extract the TLS server_config for QUIC relay BEFORE relay_tls is moved into
+    // relay_config. Both the HTTP relay and QUIC relay share the same ACME cert resolver;
+    // calling maybe_load_tls() a second time would create a separate ACME state machine
+    // which starts with no cert (causing TLS handshake failures on the QUIC port).
+    let quic_relay_tls_config: Option<(SocketAddr, rustls::ServerConfig)> =
+        if cfg.enable_quic_relay {
+            if let Some(ref tls_cfg) = cfg.tls {
+                match &relay_tls {
+                    Some(tls) => {
+                        let quic_relay_port = tls_cfg.quic_bind_addr(&cfg).port() + 1;
+                        let quic_relay_addr =
+                            SocketAddr::new(tls_cfg.quic_bind_addr(&cfg).ip(), quic_relay_port);
+                        Some((quic_relay_addr, tls.server_config.clone()))
+                    }
+                    None => bail_any!(
+                        "Must have a valid TLS configuration to enable QUIC relay transport"
+                    ),
+                }
+            } else {
+                bail_any!("Must have TLS configured to enable QUIC relay transport");
+            }
+        } else {
+            None
+        };
+
     let relay_config = if cfg.enable_relay {
         Some(relay::RelayConfig {
             http_bind_addr: cfg.http_bind_addr(),
@@ -704,36 +730,16 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig<std::io::
         None
     };
 
-    let quic_relay_config = if cfg.enable_quic_relay {
-        if let Some(ref tls_cfg) = cfg.tls {
-            // Use port 7843 for QUIC relay transport (7842 is QAD).
-            let quic_relay_port = tls_cfg.quic_bind_addr(&cfg).port() + 1;
-            let quic_relay_addr = SocketAddr::new(
-                tls_cfg.quic_bind_addr(&cfg).ip(),
-                quic_relay_port,
-            );
-            // Build a rustls server config for QUIC relay.
-            // Reuse the same cert/key as the main TLS config.
-            let quic_tls = maybe_load_tls(&cfg).await?;
-            match quic_tls {
-                Some(tls) => Some(relay::quic_relay::QuicRelayConfig {
-                    bind_addr: quic_relay_addr,
-                    server_config: tls.server_config,
-                    client_rx_ratelimit: quic_relay_ratelimit,
-                    access: std::sync::Arc::new(cfg.access.clone().into()),
-                    key_cache_capacity: cfg.key_cache_capacity.unwrap_or(
-                        iroh_relay::defaults::DEFAULT_KEY_CACHE_CAPACITY,
-                    ),
-                }),
-                None => {
-                    bail_any!("Must have a valid TLS configuration to enable QUIC relay transport");
-                }
-            }
-        } else {
-            bail_any!("Must have TLS configured to enable QUIC relay transport");
-        }
-    } else {
-        None
+    let quic_relay_config = match quic_relay_tls_config {
+        Some((bind_addr, server_config)) => Some(relay::quic_relay::QuicRelayConfig {
+            bind_addr,
+            server_config,
+            client_rx_ratelimit: quic_relay_ratelimit,
+            access: std::sync::Arc::new(cfg.access.clone().into()),
+            key_cache_capacity: cfg.key_cache_capacity
+                .unwrap_or(iroh_relay::defaults::DEFAULT_KEY_CACHE_CAPACITY),
+        }),
+        None => None,
     };
 
     Ok(relay::ServerConfig {
