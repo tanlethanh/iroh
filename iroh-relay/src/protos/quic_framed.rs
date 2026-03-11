@@ -63,8 +63,13 @@ impl From<QuicFramedError> for StreamError {
 ///
 /// Implements `Stream<Item = Result<Bytes, StreamError>>` and `Sink<Bytes, Error = StreamError>`
 /// so it can be used as a drop-in replacement for `WsBytesFramed` inside `RelayedStream<S>`.
+///
+/// The `Connection` handle is stored here to prevent it from being dropped — dropping a
+/// `noq::Connection` sends a QUIC close frame and tears down all streams.
 #[derive(Debug)]
 pub struct QuicBytesFramed {
+    /// Keep the connection alive for the lifetime of the framed streams.
+    _connection: noq::Connection,
     send: noq::SendStream,
     recv: noq::RecvStream,
     /// Read buffer for accumulating partial frames.
@@ -78,9 +83,13 @@ pub struct QuicBytesFramed {
 }
 
 impl QuicBytesFramed {
-    /// Create a new `QuicBytesFramed` from a QUIC bidirectional stream pair.
-    pub fn new(send: noq::SendStream, recv: noq::RecvStream) -> Self {
+    /// Create a new `QuicBytesFramed` from a QUIC connection and its bidirectional stream pair.
+    ///
+    /// The connection is stored internally to prevent it from being dropped (which would close
+    /// all streams and terminate the relay session).
+    pub fn new(connection: noq::Connection, send: noq::SendStream, recv: noq::RecvStream) -> Self {
         Self {
+            _connection: connection,
             send,
             recv,
             read_buf: BytesMut::with_capacity(8192),

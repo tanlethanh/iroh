@@ -329,13 +329,20 @@ impl ClientBuilder {
             .local_addr()
             .map_err(|_| e!(ConnectError::NoLocalAddr))?;
 
-        // Open a bidi stream for the relay protocol.
+        // Accept the bidi stream opened by the server (not the client).
+        // The server opens the stream and immediately sends the handshake ServerChallenge,
+        // which delivers the STREAM frame that triggers this accept_bi() to resolve.
+        // (If the client opened the stream, deadlock: server's accept_bi() waits for
+        // a STREAM frame, but the client only sends on first write, which only happens
+        // after reading the ServerChallenge — never sent because server hasn't accepted.)
         let (send, recv) = connection
-            .open_bi()
+            .accept_bi()
             .await
-            .map_err(|err| e!(ConnectError::Quic { reason: "open_bi", details: err.to_string() }))?;
+            .map_err(|err| e!(ConnectError::Quic { reason: "accept_bi", details: err.to_string() }))?;
 
-        let io = QuicBytesFramed::new(send, recv);
+        // Pass `connection` into QuicBytesFramed so it's kept alive.
+        // Dropping a noq::Connection sends a close frame and tears down all streams.
+        let io = QuicBytesFramed::new(connection, send, recv);
         let conn = Conn::new_quic(io, self.key_cache.clone(), &self.secret_key).await?;
 
         event!(

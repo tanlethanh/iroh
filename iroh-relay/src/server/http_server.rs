@@ -1049,7 +1049,7 @@ mod tests {
         let b_key = SecretKey::generate(&mut rng);
 
         // start server
-        let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+        let (server, _clients) = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
             .spawn()
             .await?;
 
@@ -1172,7 +1172,7 @@ mod tests {
         let tls_config = make_tls_config();
 
         // start server
-        let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+        let (mut server, _clients) = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
             .tls_config(Some(tls_config))
             .spawn()
             .await?;

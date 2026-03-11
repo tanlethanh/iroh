@@ -254,14 +254,20 @@ async fn handle_quic_connection(
         .map_err(|err| e!(ConnectionError::Connection, err))?;
     debug!("QUIC connection established");
 
-    // Accept the relay bidi stream (one per connection).
+    // Server opens the bidi stream (not the client). This avoids a deadlock: the
+    // handshake sends ServerChallenge first, but the client's accept_bi() won't fire
+    // until a STREAM frame arrives — which only happens when the server writes data.
+    // By having the server open the stream, the STREAM frame is sent with the first
+    // ServerChallenge write and the client's accept_bi() resolves.
     let (send, recv) = connection
-        .accept_bi()
+        .open_bi()
         .await
         .map_err(|err| e!(ConnectionError::AcceptBi, err))?;
-    trace!("accepted bidi stream");
+    trace!("opened bidi stream for handshake");
 
-    let mut io = QuicBytesFramed::new(send, recv);
+    // Pass `connection` into QuicBytesFramed so it's kept alive for the session.
+    // Dropping a noq::Connection sends a close frame and tears down all streams.
+    let mut io = QuicBytesFramed::new(connection, send, recv);
 
     // Run handshake — challenge-based (no TLS keying material export for QUIC).
     let authentication = handshake::serverside(&mut io, None).await?;
@@ -285,11 +291,7 @@ async fn handle_quic_connection(
     };
 
     clients.register(client_config, metrics);
-
-    // Keep the connection alive — the Actor handles the actual relay loop.
-    // We just need to keep the QUIC connection from being dropped.
-    connection.closed().await;
-    debug!("QUIC relay connection closed");
+    debug!("QUIC relay client registered");
 
     Ok(())
 }

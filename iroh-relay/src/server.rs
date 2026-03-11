@@ -856,6 +856,8 @@ mod tests {
             relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
         },
     };
+    #[allow(unused_imports)]
+    use std::sync::Arc;
 
     async fn spawn_local_relay() -> std::result::Result<Server, SpawnError> {
         Server::spawn(ServerConfig::<(), ()> {
@@ -867,6 +869,7 @@ mod tests {
                 access: AccessConfig::Everyone,
             }),
             quic: None,
+            quic_relay: None,
             metrics_addr: None,
         })
         .await
@@ -926,6 +929,7 @@ mod tests {
                 access: AccessConfig::Everyone,
             }),
             quic: None,
+            quic_relay: None,
             metrics_addr: Some((Ipv4Addr::LOCALHOST, 1234).into()),
         })
         .await
@@ -1062,6 +1066,7 @@ mod tests {
                 })),
             }),
             quic: None,
+            quic_relay: None,
             metrics_addr: None,
         })
         .await?;
@@ -1151,6 +1156,212 @@ mod tests {
                 })
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Generate a self-signed TLS cert for localhost, used in QUIC relay tests.
+    fn self_signed_tls_certs_and_config() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::ServerConfig,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("valid");
+        let rustls_cert = cert.cert.der();
+        let private_key =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let private_key = rustls::pki_types::PrivateKeyDer::from(private_key);
+        let certs = vec![rustls_cert.clone()];
+        let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocols supported by ring")
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), private_key)
+        .expect("valid");
+        (certs, server_config)
+    }
+
+    /// Spawns a relay server with both WS and QUIC relay transport enabled.
+    async fn spawn_quic_relay() -> (Server, std::net::SocketAddr, Vec<rustls::pki_types::CertificateDer<'static>>) {
+        use super::quic_relay::QuicRelayConfig;
+
+        let (certs, server_tls_config) = self_signed_tls_certs_and_config();
+
+        let server = Server::spawn(ServerConfig::<(), ()> {
+            relay: Some(RelayConfig::<(), ()> {
+                http_bind_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                tls: None,
+                limits: Default::default(),
+                key_cache_capacity: Some(1024),
+                access: AccessConfig::Everyone,
+            }),
+            quic: None,
+            quic_relay: Some(QuicRelayConfig {
+                bind_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                server_config: server_tls_config,
+                client_rx_ratelimit: None,
+                access: std::sync::Arc::new(AccessConfig::Everyone),
+                key_cache_capacity: 1024,
+            }),
+            metrics_addr: None,
+        })
+        .await
+        .unwrap();
+
+        let quic_relay_addr = server.quic_relay_addr().expect("QUIC relay should be running");
+        (server, quic_relay_addr, certs)
+    }
+
+    /// Creates a QUIC client endpoint configured with the given server certs.
+    fn make_quic_client_endpoint(
+        server_certs: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> noq::Endpoint {
+        use std::sync::Arc;
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in server_certs {
+            roots.add(cert.clone()).expect("valid cert");
+        }
+
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports default versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        client_crypto.alpn_protocols = vec![crate::ALPN_QUIC_RELAY.to_vec()];
+
+        let client_config = noq::ClientConfig::new(Arc::new(
+            noq::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("valid"),
+        ));
+
+        let mut endpoint = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0u16).into())
+            .expect("bind client endpoint");
+        endpoint.set_default_client_config(client_config);
+        endpoint
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_quic_relay_clients() -> Result<()> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42u64);
+        let (_server, quic_relay_addr, certs) = spawn_quic_relay().await;
+
+        // Also need the WS relay URL for ClientBuilder (it holds the relay identity).
+        let relay_url: RelayUrl = format!("http://{}", _server.http_addr().unwrap()).parse()?;
+
+        // Client A connects via QUIC relay.
+        let a_secret_key = SecretKey::generate(&mut rng);
+        let a_key = a_secret_key.public();
+        let resolver = dns_resolver();
+        let ep_a = make_quic_client_endpoint(&certs);
+        info!("client a: connecting via QUIC relay to {quic_relay_addr}");
+        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver.clone())
+            .connect_quic(&ep_a, quic_relay_addr)
+            .await?;
+
+        // Client B connects via QUIC relay.
+        let b_secret_key = SecretKey::generate(&mut rng);
+        let b_key = b_secret_key.public();
+        let ep_b = make_quic_client_endpoint(&certs);
+        info!("client b: connecting via QUIC relay to {quic_relay_addr}");
+        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver.clone())
+            .connect_quic(&ep_b, quic_relay_addr)
+            .await?;
+
+        // Send message from A to B.
+        info!("sending a -> b via QUIC relay");
+        let msg = Datagrams::from("hello via QUIC relay");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        let RelayToClientMsg::Datagrams {
+            remote_endpoint_id,
+            datagrams,
+        } = res
+        else {
+            panic!("client_b received unexpected message {res:?}");
+        };
+        assert_eq!(a_key, remote_endpoint_id);
+        assert_eq!(msg, datagrams);
+
+        // Send message from B to A.
+        info!("sending b -> a via QUIC relay");
+        let msg = Datagrams::from("reply via QUIC relay");
+        let res = try_send_recv(&mut client_b, &mut client_a, a_key, msg.clone()).await?;
+        let RelayToClientMsg::Datagrams {
+            remote_endpoint_id,
+            datagrams,
+        } = res
+        else {
+            panic!("client_a received unexpected message {res:?}");
+        };
+        assert_eq!(b_key, remote_endpoint_id);
+        assert_eq!(msg, datagrams);
+
+        info!("QUIC relay test passed!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_quic_relay_cross_transport() -> Result<()> {
+        // Test that a WS client and a QUIC client can relay to each other.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(99u64);
+        let (_server, quic_relay_addr, certs) = spawn_quic_relay().await;
+        let relay_url: RelayUrl = format!("http://{}", _server.http_addr().unwrap()).parse()?;
+        let resolver = dns_resolver();
+
+        // Client A connects via WebSocket (traditional).
+        let a_secret_key = SecretKey::generate(&mut rng);
+        let a_key = a_secret_key.public();
+        info!("client a: connecting via WebSocket");
+        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver.clone())
+            .connect()
+            .await?;
+
+        // Client B connects via QUIC relay.
+        let b_secret_key = SecretKey::generate(&mut rng);
+        let b_key = b_secret_key.public();
+        let ep_b = make_quic_client_endpoint(&certs);
+        info!("client b: connecting via QUIC relay to {quic_relay_addr}");
+        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver.clone())
+            .connect_quic(&ep_b, quic_relay_addr)
+            .await?;
+
+        // WS client A -> QUIC client B
+        info!("sending a (WS) -> b (QUIC)");
+        let msg = Datagrams::from("ws to quic");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        let RelayToClientMsg::Datagrams {
+            remote_endpoint_id,
+            datagrams,
+        } = res
+        else {
+            panic!("client_b received unexpected message {res:?}");
+        };
+        assert_eq!(a_key, remote_endpoint_id);
+        assert_eq!(msg, datagrams);
+
+        // QUIC client B -> WS client A
+        info!("sending b (QUIC) -> a (WS)");
+        let msg = Datagrams::from("quic to ws");
+        let res = try_send_recv(&mut client_b, &mut client_a, a_key, msg.clone()).await?;
+        let RelayToClientMsg::Datagrams {
+            remote_endpoint_id,
+            datagrams,
+        } = res
+        else {
+            panic!("client_a received unexpected message {res:?}");
+        };
+        assert_eq!(b_key, remote_endpoint_id);
+        assert_eq!(msg, datagrams);
+
+        info!("cross-transport relay test passed!");
         Ok(())
     }
 }
