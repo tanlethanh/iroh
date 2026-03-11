@@ -46,6 +46,7 @@ pub mod client;
 pub mod clients;
 pub mod http_server;
 mod metrics;
+pub mod quic_relay;
 pub(crate) mod resolver;
 pub mod streams;
 #[cfg(feature = "test-utils")]
@@ -95,8 +96,13 @@ fn body_empty() -> BytesBody {
 pub struct ServerConfig<EC: fmt::Debug, EA: fmt::Debug = EC> {
     /// Configuration for the Relay server, disabled if `None`.
     pub relay: Option<RelayConfig<EC, EA>>,
-    /// Configuration for the QUIC server, disabled if `None`.
+    /// Configuration for the QUIC address discovery server, disabled if `None`.
     pub quic: Option<QuicConfig>,
+    /// Configuration for the QUIC relay transport server, disabled if `None`.
+    ///
+    /// When enabled, clients can connect to the relay via QUIC instead of WebSocket/TLS/TCP,
+    /// eliminating TCP delayed ACK and Nagle overhead for lower latency.
+    pub quic_relay: Option<quic_relay::QuicRelayConfig>,
     /// Socket to serve metrics on.
     #[cfg(feature = "metrics")]
     pub metrics_addr: Option<SocketAddr>,
@@ -249,12 +255,16 @@ pub struct Server {
     /// If the Relay server is not using TLS then it is served from the
     /// [`Server::http_addr`].
     https_addr: Option<SocketAddr>,
-    /// The address of the QUIC server, if configured.
+    /// The address of the QUIC address discovery server, if configured.
     quic_addr: Option<SocketAddr>,
+    /// The address of the QUIC relay transport server, if configured.
+    quic_relay_addr: Option<SocketAddr>,
     /// Handle to the relay server.
     relay_handle: Option<http_server::ServerHandle>,
     /// Handle to the quic server.
     quic_handle: Option<QuicServerHandle>,
+    /// Handle to the QUIC relay transport server.
+    quic_relay_handle: Option<quic_relay::ServerHandle>,
     /// The main task running the server.
     supervisor: AbortOnDropHandle<Result<(), SupervisorError>>,
     /// The certificate for the server.
@@ -274,6 +284,8 @@ pub enum SpawnError {
     LocalAddr { source: std::io::Error },
     #[error("Failed to bind QAD listener")]
     QuicSpawn { source: QuicSpawnError },
+    #[error("Failed to bind QUIC relay listener")]
+    QuicRelaySpawn { source: quic_relay::SpawnError },
     #[error("Failed to parse TLS header")]
     TlsHeaderParse { source: InvalidHeaderValue },
     #[error("Failed to bind TcpListener")]
@@ -355,7 +367,7 @@ impl Server {
         let quic_addr = quic_server.as_ref().map(|srv| srv.bind_addr());
         let quic_handle = quic_server.as_ref().map(|srv| srv.handle());
 
-        let (relay_server, http_addr) = match config.relay {
+        let (relay_server, http_addr, relay_clients) = match config.relay {
             Some(relay_config) => {
                 debug!("Starting Relay server");
                 let mut headers = HeaderMap::new();
@@ -451,23 +463,51 @@ impl Server {
                         None
                     }
                 };
-                let relay_server = builder.spawn().await?;
-                (Some(relay_server), http_addr)
+                let (relay_server, clients) = builder.spawn().await?;
+                (Some(relay_server), http_addr, Some(clients))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         // If http_addr is Some then relay_server is serving HTTPS.  If http_addr is None
         // relay_server is serving HTTP, including the /generate_204 service.
         let relay_addr = relay_server.as_ref().map(|srv| srv.addr());
         let relay_handle = relay_server.as_ref().map(|srv| srv.handle());
-        let task = tokio::spawn(relay_supervisor(tasks, relay_server, quic_server));
+
+        // Spawn QUIC relay transport server if configured.
+        let quic_relay_server = match config.quic_relay {
+            Some(quic_relay_config) => {
+                // Share the Clients registry with the HTTP relay, or create a new one.
+                let shared_clients = relay_clients.unwrap_or_default();
+                debug!("Starting QUIC relay transport server on {}", quic_relay_config.bind_addr);
+                Some(
+                    quic_relay::QuicRelayServer::spawn(
+                        quic_relay_config,
+                        shared_clients,
+                        metrics.server.clone(),
+                    )
+                    .map_err(|err| e!(SpawnError::QuicRelaySpawn, err))?,
+                )
+            }
+            None => None,
+        };
+        let quic_relay_addr = quic_relay_server.as_ref().map(|srv| srv.bind_addr());
+        let quic_relay_handle = quic_relay_server.as_ref().map(|srv| srv.handle());
+
+        let task = tokio::spawn(relay_supervisor(
+            tasks,
+            relay_server,
+            quic_server,
+            quic_relay_server,
+        ));
 
         Ok(Self {
             http_addr: http_addr.or(relay_addr),
             https_addr: http_addr.and(relay_addr),
             quic_addr,
+            quic_relay_addr,
             relay_handle,
             quic_handle,
+            quic_relay_handle,
             supervisor: AbortOnDropHandle::new(task),
             certificates,
             metrics,
@@ -478,12 +518,13 @@ impl Server {
     ///
     /// Returns once all server tasks have stopped.
     pub async fn shutdown(self) -> Result<(), SupervisorError> {
-        // Only the Relay server and QUIC server need shutting down, the supervisor will abort the tasks in
-        // the JoinSet when the server terminates.
         if let Some(handle) = self.relay_handle {
             handle.shutdown();
         }
         if let Some(handle) = self.quic_handle {
+            handle.shutdown();
+        }
+        if let Some(handle) = self.quic_relay_handle {
             handle.shutdown();
         }
         self.supervisor.await?
@@ -507,9 +548,14 @@ impl Server {
         self.http_addr
     }
 
-    /// The socket address the QUIC server is listening on.
+    /// The socket address the QUIC address discovery server is listening on.
     pub fn quic_addr(&self) -> Option<SocketAddr> {
         self.quic_addr
+    }
+
+    /// The socket address the QUIC relay transport server is listening on.
+    pub fn quic_relay_addr(&self) -> Option<SocketAddr> {
+        self.quic_relay_addr
     }
 
     /// The certificates chain if configured with manual TLS certificates.
@@ -556,6 +602,7 @@ async fn relay_supervisor(
     mut tasks: JoinSet<Result<(), SupervisorError>>,
     mut relay_http_server: Option<http_server::Server>,
     mut quic_server: Option<QuicServer>,
+    mut quic_relay_server: Option<quic_relay::QuicRelayServer>,
 ) -> Result<(), SupervisorError> {
     let quic_enabled = quic_server.is_some();
     let mut quic_fut = match quic_server {
@@ -567,11 +614,17 @@ async fn relay_supervisor(
         Some(ref mut server) => n0_future::Either::Left(server.task_handle()),
         None => n0_future::Either::Right(n0_future::future::pending()),
     };
+    let quic_relay_enabled = quic_relay_server.is_some();
+    let mut quic_relay_fut = match quic_relay_server {
+        Some(ref mut server) => n0_future::Either::Left(server.task_handle()),
+        None => n0_future::Either::Right(n0_future::future::pending()),
+    };
     let res = tokio::select! {
         biased;
         Some(ret) = tasks.join_next() => ret,
         ret = &mut quic_fut, if quic_enabled => ret.map(Ok),
         ret = &mut relay_fut, if relay_enabled => ret.map(Ok),
+        ret = &mut quic_relay_fut, if quic_relay_enabled => ret.map(Ok),
         else => Ok(Err(e!(SupervisorError::NoRelayServicesEnabled))),
     };
     let ret = match res {
@@ -593,14 +646,16 @@ async fn relay_supervisor(
         }
     };
 
-    // Ensure the HTTP server terminated, there is no harm in calling this after it is
-    // already shut down.
+    // Ensure the HTTP server terminated
     if let Some(server) = relay_http_server {
         server.shutdown();
     }
 
-    // Ensure the QUIC server is closed
+    // Ensure the QUIC servers are closed
     if let Some(server) = quic_server {
+        server.shutdown().await;
+    }
+    if let Some(server) = quic_relay_server {
         server.shutdown().await;
     }
 

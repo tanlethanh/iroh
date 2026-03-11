@@ -124,6 +124,16 @@ struct Config {
     /// Defaults to `false`
     #[serde(default = "cfg_defaults::enable_quic_addr_discovery")]
     enable_quic_addr_discovery: bool,
+    /// Whether to enable QUIC relay transport.
+    ///
+    /// When enabled, clients can connect via QUIC (on the same port as QAD, port 7842)
+    /// for lower-latency relaying, bypassing WebSocket/TLS/TCP overhead.
+    ///
+    /// Requires `tls` to be configured.
+    ///
+    /// Defaults to `false`
+    #[serde(default = "cfg_defaults::enable_quic_relay")]
+    enable_quic_relay: bool,
     /// Rate limiting configuration.
     ///
     /// Disabled if not present.
@@ -303,6 +313,7 @@ impl Default for Config {
             metrics_bind_addr: None,
             key_cache_capacity: Default::default(),
             access: AccessConfig::Everyone,
+            enable_quic_relay: cfg_defaults::enable_quic_relay(),
         }
     }
 }
@@ -317,6 +328,10 @@ mod cfg_defaults {
     }
 
     pub(crate) fn enable_quic_addr_discovery() -> bool {
+        false
+    }
+
+    pub(crate) fn enable_quic_relay() -> bool {
         false
     }
 
@@ -675,6 +690,7 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig<std::io::
         None => Default::default(),
     };
 
+    let quic_relay_ratelimit = limits.client_rx;
     let relay_config = if cfg.enable_relay {
         Some(relay::RelayConfig {
             http_bind_addr: cfg.http_bind_addr(),
@@ -688,9 +704,42 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig<std::io::
         None
     };
 
+    let quic_relay_config = if cfg.enable_quic_relay {
+        if let Some(ref tls_cfg) = cfg.tls {
+            // Use port 7843 for QUIC relay transport (7842 is QAD).
+            let quic_relay_port = tls_cfg.quic_bind_addr(&cfg).port() + 1;
+            let quic_relay_addr = SocketAddr::new(
+                tls_cfg.quic_bind_addr(&cfg).ip(),
+                quic_relay_port,
+            );
+            // Build a rustls server config for QUIC relay.
+            // Reuse the same cert/key as the main TLS config.
+            let quic_tls = maybe_load_tls(&cfg).await?;
+            match quic_tls {
+                Some(tls) => Some(relay::quic_relay::QuicRelayConfig {
+                    bind_addr: quic_relay_addr,
+                    server_config: tls.server_config,
+                    client_rx_ratelimit: quic_relay_ratelimit,
+                    access: std::sync::Arc::new(cfg.access.clone().into()),
+                    key_cache_capacity: cfg.key_cache_capacity.unwrap_or(
+                        iroh_relay::defaults::DEFAULT_KEY_CACHE_CAPACITY,
+                    ),
+                }),
+                None => {
+                    bail_any!("Must have a valid TLS configuration to enable QUIC relay transport");
+                }
+            }
+        } else {
+            bail_any!("Must have TLS configured to enable QUIC relay transport");
+        }
+    } else {
+        None
+    };
+
     Ok(relay::ServerConfig {
         relay: relay_config,
         quic: quic_config,
+        quic_relay: quic_relay_config,
         #[cfg(feature = "metrics")]
         metrics_addr: Some(cfg.metrics_bind_addr()).filter(|_| cfg.enable_metrics),
     })

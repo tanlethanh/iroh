@@ -401,7 +401,10 @@ impl ServerBuilder {
     }
 
     /// Builds and spawns an HTTP(S) Relay Server.
-    pub(super) async fn spawn(self) -> Result<Server, SpawnError> {
+    ///
+    /// Returns the server and the shared `Clients` registry, which can be passed
+    /// to other server components (e.g., QUIC relay transport) for cross-transport routing.
+    pub(super) async fn spawn(self) -> Result<(Server, Clients), SpawnError> {
         let cancel_token = CancellationToken::new();
 
         let service = RelayService::new(
@@ -428,6 +431,7 @@ impl ServerBuilder {
         let http_str = tls_config.as_ref().map_or("HTTP/WS", |_| "HTTPS/WSS");
         info!("[{http_str}] relay: serving on {addr}");
 
+        let clients = service.clients().clone();
         let cancel = cancel_token.clone();
         let task = tokio::task::spawn(
             async move {
@@ -471,11 +475,14 @@ impl ServerBuilder {
             .instrument(info_span!("relay-http-serve")),
         );
 
-        Ok(Server {
-            addr,
-            http_server_task: AbortOnDropHandle::new(task),
-            cancel_server_loop: cancel_token,
-        })
+        Ok((
+            Server {
+                addr,
+                http_server_task: AbortOnDropHandle::new(task),
+                cancel_server_loop: cancel_token,
+            },
+            clients,
+        ))
     }
 }
 
@@ -808,6 +815,11 @@ impl RelayService {
             access,
             metrics,
         }))
+    }
+
+    /// Returns a reference to the shared clients registry.
+    pub fn clients(&self) -> &Clients {
+        &self.0.clients
     }
 
     /// Shuts down the relay service, disconnecting all clients.
