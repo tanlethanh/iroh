@@ -29,8 +29,7 @@ use crate::{
     },
 };
 
-/// ALPN protocol identifier for QUIC relay transport.
-pub const ALPN_QUIC_RELAY: &[u8] = b"/iroh-relay/0";
+pub use crate::ALPN_QUIC_RELAY;
 
 /// Write timeout for QUIC relay client connections.
 const QUIC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);

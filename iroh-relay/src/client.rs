@@ -89,6 +89,12 @@ pub enum ConnectError {
     #[cfg(wasm_browser)]
     #[error("The relay protocol is not available in browsers")]
     RelayProtoNotAvailable {},
+    #[cfg(not(wasm_browser))]
+    #[error("QUIC relay failed: {reason}: {details}")]
+    Quic {
+        reason: &'static str,
+        details: String,
+    },
 }
 
 /// Errors that can occur while dialing the relay server.
@@ -289,6 +295,57 @@ impl ClientBuilder {
         );
 
         trace!("connect done");
+
+        Ok(Client {
+            conn,
+            local_addr: Some(local_addr),
+        })
+    }
+
+    /// Establishes a new connection to the relay server using native QUIC transport.
+    ///
+    /// This bypasses WebSocket/TLS/TCP entirely, connecting directly over QUIC.
+    /// The relay server must have QUIC relay transport enabled (port 7843 by default).
+    ///
+    /// `quic_endpoint` is a pre-configured QUIC endpoint with the relay's TLS config.
+    /// `relay_quic_addr` is the relay server's QUIC relay address (typically port 7843).
+    #[cfg(not(wasm_browser))]
+    pub async fn connect_quic(
+        &self,
+        quic_endpoint: &noq::Endpoint,
+        relay_quic_addr: std::net::SocketAddr,
+    ) -> Result<Client, ConnectError> {
+        use crate::protos::quic_framed::QuicBytesFramed;
+
+        debug!(%relay_quic_addr, "Dialing relay by QUIC");
+
+        let connection = quic_endpoint
+            .connect(relay_quic_addr, self.url.host_str().unwrap_or("relay"))
+            .map_err(|err| e!(ConnectError::Quic { reason: "connect", details: err.to_string() }))?
+            .await
+            .map_err(|err| e!(ConnectError::Quic { reason: "connection", details: err.to_string() }))?;
+
+        let local_addr = quic_endpoint
+            .local_addr()
+            .map_err(|_| e!(ConnectError::NoLocalAddr))?;
+
+        // Open a bidi stream for the relay protocol.
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|err| e!(ConnectError::Quic { reason: "open_bi", details: err.to_string() }))?;
+
+        let io = QuicBytesFramed::new(send, recv);
+        let conn = Conn::new_quic(io, self.key_cache.clone(), &self.secret_key).await?;
+
+        event!(
+            target: "iroh::_events::net::relay::connected",
+            Level::DEBUG,
+            url = %self.url,
+            transport = "quic",
+        );
+
+        trace!("connect_quic done");
 
         Ok(Client {
             conn,

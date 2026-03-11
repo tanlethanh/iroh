@@ -45,6 +45,9 @@ mod key_cache;
 mod relay_map;
 pub use key_cache::KeyCache;
 
+/// ALPN protocol identifier for QUIC relay transport.
+pub const ALPN_QUIC_RELAY: &[u8] = b"/iroh-relay/0";
+
 #[cfg(not(wasm_browser))]
 pub mod dns;
 pub mod endpoint_info;

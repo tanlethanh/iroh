@@ -2,7 +2,7 @@
 
 pub mod common;
 pub mod handshake;
-#[cfg(feature = "server")]
+#[cfg(not(wasm_browser))]
 pub mod quic_framed;
 pub mod relay;
 pub mod streams;
