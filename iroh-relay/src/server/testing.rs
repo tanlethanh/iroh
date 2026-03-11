@@ -83,6 +83,7 @@ pub fn server_config() -> ServerConfig<()> {
     ServerConfig {
         relay: Some(relay_config()),
         quic: Some(quic_config()),
+        quic_relay: None,
         #[cfg(feature = "metrics")]
         metrics_addr: None,
     }

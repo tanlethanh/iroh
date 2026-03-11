@@ -144,6 +144,9 @@ pub struct ClientBuilder {
     url: RelayUrl,
     /// TLS verification config.
     tls_config: Option<rustls::ClientConfig>,
+    /// Allow self-signed certificates from relay servers (test-utils only).
+    #[cfg(any(test, feature = "test-utils"))]
+    insecure_skip_cert_verify: bool,
     /// HTTP Proxy
     proxy_url: Option<Url>,
     /// The secret key of this client.
@@ -166,12 +169,23 @@ impl ClientBuilder {
             address_family_selector: None,
             url: url.into(),
             tls_config: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            insecure_skip_cert_verify: false,
             proxy_url: None,
             secret_key,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             key_cache: KeyCache::new(128),
         }
+    }
+
+    /// Skip the verification of the relay server's SSL certificates.
+    ///
+    /// May only be used in tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn insecure_skip_cert_verify(mut self, skip: bool) -> Self {
+        self.insecure_skip_cert_verify = skip;
+        self
     }
 
     /// Sets a custom TLS config.
